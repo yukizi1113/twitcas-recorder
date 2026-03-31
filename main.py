@@ -24,7 +24,12 @@ from datetime import datetime
 # パス定義
 # ============================================================
 
-APP_DIR = Path(__file__).parent
+# PyInstaller --onefile でビルドした場合は sys.executable の親ディレクトリを使う
+# (sys._MEIPASS は一時展開先のため設定ファイル保存に不適)
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
 CONFIG_FILE = APP_DIR / "config.json"
 COOKIES_JSON_FILE = APP_DIR / "cookies.json"
 NETSCAPE_COOKIES_FILE = APP_DIR / "cookies.txt"
