@@ -47,6 +47,10 @@ namespace TwitCasRecorder
         public string YtdlpPath { get; set; }
         public string FfmpegPath { get; set; }
 
+        // TwitCasting API v2 認証
+        public string ApiClientId { get; set; }
+        public string ApiClientSecret { get; set; }
+
         // Whisper 設定
         public bool AutoTranscribe { get; set; }
         public string WhisperPath { get; set; }
@@ -61,6 +65,8 @@ namespace TwitCasRecorder
             CheckInterval   = 30;
             YtdlpPath       = "yt-dlp";
             FfmpegPath      = "ffmpeg";
+            ApiClientId     = "";
+            ApiClientSecret = "";
             AutoTranscribe  = false;
             WhisperPath     = "whisper";
             WhisperModel    = "large";
@@ -79,6 +85,7 @@ namespace TwitCasRecorder
     class TwitCastingAuth
     {
         private readonly CookieContainer _cookies = new CookieContainer();
+        public CookieContainer CookieJar { get { return _cookies; } }
         private static readonly Uri TcUri = new Uri("https://twitcasting.tv/");
         public bool IsLoggedIn { get; private set; }
 
@@ -179,6 +186,8 @@ namespace TwitCasRecorder
                           + "Chrome/122.0.0.0 Safari/537.36";
             req.Accept = "application/json, text/html, */*";
             req.Headers["Accept-Language"] = "ja,en-US;q=0.9";
+            req.Headers["Origin"]          = "https://twitcasting.tv";
+            req.Referer                    = "https://twitcasting.tv/";
             req.AllowAutoRedirect = true;
             return req;
         }
@@ -281,34 +290,61 @@ namespace TwitCasRecorder
     class StreamMonitor
     {
         private readonly TwitCastingAuth _auth;
-        public StreamMonitor(TwitCastingAuth auth) { _auth = auth; }
+        private readonly AppConfig _config;
+        private readonly Action<string> _log;
+        public StreamMonitor(TwitCastingAuth auth, AppConfig config, Action<string> log)
+        {
+            _auth   = auth;
+            _config = config;
+            _log    = log;
+        }
 
+        // 公式 API v2: GET /users/:user_id/current_live
+        // 配信中 → 200 + JSON、配信なし → 404
         public LiveInfo CheckLive(string userId)
         {
             var info = new LiveInfo();
             try
             {
-                var req = _auth.CreateAuthRequest(
-                    "https://frontendapi.twitcasting.tv/users/" + userId + "/latest-movie");
-                req.Method = "GET";
+                string url = "https://apiv2.twitcasting.tv/users/" + userId + "/current_live";
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method  = "GET";
+                req.Accept  = "application/json";
+                req.Headers["X-Api-Version"] = "2.0";
+
+                // 認証: ClientID/Secret が設定されていれば Basic 認証
+                if (!string.IsNullOrEmpty(_config.ApiClientId) &&
+                    !string.IsNullOrEmpty(_config.ApiClientSecret))
+                {
+                    string cred = _config.ApiClientId + ":" + _config.ApiClientSecret;
+                    string b64  = Convert.ToBase64String(Encoding.ASCII.GetBytes(cred));
+                    req.Headers["Authorization"] = "Basic " + b64;
+                }
+                else
+                {
+                    // Cookie 認証フォールバック
+                    req.CookieContainer = _auth.CookieJar;
+                    req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                  + "Chrome/122.0.0.0 Safari/537.36";
+                    req.Headers["Origin"] = "https://twitcasting.tv";
+                    req.Referer           = "https://twitcasting.tv/";
+                }
+
                 string json;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                     json = sr.ReadToEnd();
 
-                var ser  = new JavaScriptSerializer();
-                var data = ser.Deserialize<Dictionary<string, object>>(json);
-
-                object livVal;
-                if (data.TryGetValue("is_on_live", out livVal) && livVal is bool)
-                    info.IsOnLive = (bool)livVal;
-
+                var ser   = new JavaScriptSerializer();
+                var data  = ser.Deserialize<Dictionary<string, object>>(json);
                 object movieVal;
                 if (data.TryGetValue("movie", out movieVal))
                 {
                     var movie = movieVal as Dictionary<string, object>;
                     if (movie != null)
                     {
+                        info.IsOnLive = true;
                         object idVal;
                         if (movie.TryGetValue("id", out idVal) && idVal != null)
                             info.MovieId = idVal.ToString();
@@ -318,7 +354,30 @@ namespace TwitCasRecorder
                     }
                 }
             }
-            catch { }
+            catch (WebException ex)
+            {
+                var resp = ex.Response as HttpWebResponse;
+                if (resp != null && resp.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // 404 = 配信していない (正常)
+                }
+                else if (resp != null && resp.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    _log("[API エラー] " + userId + " : 401 Unauthorized — ClientID/Secret を確認してください");
+                }
+                else if (resp != null)
+                {
+                    _log("[API エラー] " + userId + " : HTTP " + (int)resp.StatusCode + " " + resp.StatusCode);
+                }
+                else
+                {
+                    _log("[API エラー] " + userId + " : " + ex.Message);
+                }
+            }
+            catch (Exception ex)
+            {
+                _log("[API エラー] " + userId + " : " + ex.Message);
+            }
             return info;
         }
     }
@@ -702,6 +761,7 @@ namespace TwitCasRecorder
         private TextBox _tbWhisperLang, _tbWhisperPath, _tbManualFile;
         // 詳細設定タブ
         private TextBox _tbOutputDir, _tbInterval, _tbYtdlp, _tbFfmpeg;
+        private TextBox _tbApiClientId, _tbApiClientSecret;
         // 下部
         private Label _lblMonitorStatus;
         private Button _btnStart, _btnStop;
@@ -723,7 +783,7 @@ namespace TwitCasRecorder
 
             _config      = ConfigManager.Load();
             _auth        = new TwitCastingAuth();
-            _monitor     = new StreamMonitor(_auth);
+            _monitor     = new StreamMonitor(_auth, _config, Log);
             _transcriber = new Transcriber(_config, Log);
             _recorder    = new StreamRecorder(_config, _auth, Log, OnRecordComplete);
 
@@ -988,6 +1048,32 @@ namespace TwitCasRecorder
             _tbFfmpeg.Text = _config.FfmpegPath;
             y += 40;
 
+            // TwitCasting API v2 認証
+            var grpApi = new GroupBox
+            {
+                Text = "TwitCasting API v2 認証（ライブ検出に使用）",
+                Location = new Point(10, y), Width = 590, Height = 105, Parent = page
+            };
+            int gy = 22;
+            new Label { Text = "Client ID :", Location = new Point(10, gy + 3), Width = 120, Parent = grpApi };
+            _tbApiClientId = new TextBox { Location = new Point(135, gy), Width = 420, Parent = grpApi };
+            _tbApiClientId.Text = _config.ApiClientId;
+            gy += 30;
+            new Label { Text = "Client Secret :", Location = new Point(10, gy + 3), Width = 120, Parent = grpApi };
+            _tbApiClientSecret = new TextBox
+            {
+                Location = new Point(135, gy), Width = 420,
+                UseSystemPasswordChar = true, Parent = grpApi
+            };
+            _tbApiClientSecret.Text = _config.ApiClientSecret;
+            gy += 30;
+            new Label
+            {
+                Text = "※ https://twitcasting.tv/developer/ でアプリ登録して取得してください",
+                Location = new Point(10, gy), Width = 540, ForeColor = Color.Gray, Parent = grpApi
+            };
+            y += 115;
+
             var btnSave = new Button { Text = "設定を保存", Location = new Point(175, y), Width = 100, Parent = page };
             btnSave.Click += OnSaveSettings;
         }
@@ -997,8 +1083,10 @@ namespace TwitCasRecorder
             _config.OutputDir = _tbOutputDir.Text.Trim();
             int iv;
             if (int.TryParse(_tbInterval.Text, out iv) && iv > 0) _config.CheckInterval = iv;
-            _config.YtdlpPath  = _tbYtdlp.Text.Trim();
-            _config.FfmpegPath = _tbFfmpeg.Text.Trim();
+            _config.YtdlpPath       = _tbYtdlp.Text.Trim();
+            _config.FfmpegPath      = _tbFfmpeg.Text.Trim();
+            _config.ApiClientId     = _tbApiClientId.Text.Trim();
+            _config.ApiClientSecret = _tbApiClientSecret.Text.Trim();
             ConfigManager.Save(_config);
             _recorder = new StreamRecorder(_config, _auth, Log, OnRecordComplete);
             MessageBox.Show("設定を保存しました");
@@ -1213,6 +1301,8 @@ namespace TwitCasRecorder
                 cfg.OutputDir       = GetStr(raw, "OutputDir",       cfg.OutputDir);
                 cfg.YtdlpPath       = GetStr(raw, "YtdlpPath",       cfg.YtdlpPath);
                 cfg.FfmpegPath      = GetStr(raw, "FfmpegPath",      cfg.FfmpegPath);
+                cfg.ApiClientId     = GetStr(raw, "ApiClientId",     cfg.ApiClientId);
+                cfg.ApiClientSecret = GetStr(raw, "ApiClientSecret", cfg.ApiClientSecret);
                 cfg.WhisperPath     = GetStr(raw, "WhisperPath",     cfg.WhisperPath);
                 cfg.WhisperModel    = GetStr(raw, "WhisperModel",    cfg.WhisperModel);
                 cfg.WhisperLanguage = GetStr(raw, "WhisperLanguage", cfg.WhisperLanguage);
@@ -1272,6 +1362,11 @@ namespace TwitCasRecorder
         [STAThread]
         static void Main()
         {
+            // TLS 1.2 を強制 (.NET 4.x デフォルトは TLS 1.0 のため)
+            ServicePointManager.SecurityProtocol =
+                (SecurityProtocolType)3072  // Tls12
+              | (SecurityProtocolType)768   // Tls11
+              | SecurityProtocolType.Tls;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
