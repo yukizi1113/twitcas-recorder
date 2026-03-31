@@ -14,27 +14,36 @@ TwitCasting の配信を自動で音声録音するツールです。
 
 ---
 
+## バージョンについて
+
+| ファイル | 言語 | exeサイズ | 備考 |
+|----------|------|-----------|------|
+| `ツイキャス録音君.exe` | **C# / WinForms** | **32 KB** | **推奨** |
+| `main.py` | Python | (要PyInstaller) | 開発・改造用 |
+
+C# 版は Windows に標準搭載の .NET Framework 4.x を使用するため、追加ランタイム不要で超軽量です。
+
+---
+
 ## 必要なもの
 
-### Python (3.9 以上)
+### yt-dlp（必須）
 
-https://www.python.org/downloads/ からインストールしてください。
-
-### yt-dlp
+録音のバックエンドとして使用します。コマンドプロンプトで以下を実行してください。
 
 ```
 pip install yt-dlp
 ```
 
-### ffmpeg
+> Python がない場合は https://www.python.org/downloads/ からインストール後に実行してください。
+
+### ffmpeg（必須）
 
 yt-dlp が音声変換に使用します。
 
 1. https://github.com/BtbN/FFmpeg-Builds/releases から `ffmpeg-master-latest-win64-gpl.zip` をダウンロード
-2. 展開して `ffmpeg.exe` を `C:\ffmpeg\bin\` に配置
-3. システム環境変数 `PATH` に `C:\ffmpeg\bin` を追加
-
-> yt-dlp は `pip install yt-dlp` でインストール済みの場合、`yt-dlp --update-to nightly` で ffmpeg を自動ダウンロードできることもあります。
+2. 展開して `ffmpeg.exe` を適当なフォルダに配置
+3. そのフォルダをシステム環境変数 `PATH` に追加（または後述の「詳細設定」で直接パスを指定）
 
 ---
 
@@ -42,17 +51,17 @@ yt-dlp が音声変換に使用します。
 
 ```bash
 git clone https://github.com/yukizi1113/twitcas-recorder.git
-cd twitcas-recorder
-pip install -r requirements.txt
 ```
+
+または ZIP でダウンロードして展開するだけです。
 
 ---
 
 ## 起動方法
 
-```bash
-python main.py
-```
+`ツイキャス録音君.exe` をダブルクリックするだけです。
+
+> **Python 不要** — .NET Framework 4.x は Windows 10 / 11 に標準搭載されています。
 
 ---
 
@@ -68,50 +77,66 @@ python main.py
 | 表示名 | ログに表示される名前（省略可） |
 | 合言葉 / パスワード | パスワード保護配信のみ入力（通常配信は空欄） |
 
+---
+
 ### 2. メンバーシップ限定配信を録音する場合
 
-「アカウント設定」タブで TwitCasting アカウントにログインします。
+「アカウント設定」タブで認証情報をセットします。
 
 #### 方法 A: TC アカウントでログイン
 
-メールアドレス（またはユーザー名）とパスワードを入力して「ログイン」。
+TwitCasting のユーザー名（またはメールアドレス）とパスワードを入力して「ログイン」。
 
 #### 方法 B: ブラウザの Cookie を貼り付ける（推奨）
 
-Twitter/X・Google などの OAuth ログインを使っている場合はこちらを使用してください。
+Twitter/X・Google などの OAuth でログインしている場合はこちら。
 
 1. ブラウザで [twitcasting.tv](https://twitcasting.tv/) にログイン
 2. `F12` → **アプリケーション** → **Cookie** → `twitcasting.tv` を開く
-3. `tc_ss` や `tc_id` などの Cookie をコピー
-4. テキストボックスに `名前=値; 名前=値; ...` 形式で貼り付けて「Cookie をセット」
+3. `tc_id` と `tc_ss` の値をコピーして以下の形式で貼り付け
+
+```
+tc_id=（値）; tc_ss=（値）
+```
+
+4. 「Cookie をセット」ボタンをクリック → 緑色で「ログイン済み」と表示されれば完了
+
+> Cookie の有効期限が切れた場合は同じ手順で再取得・再入力してください。
+
+---
 
 ### 3. 監視・録音を開始する
 
-画面下部の **▶ 監視・録音開始** ボタンをクリックします。
+画面下部の **▶ 監視・録音開始** ボタンをクリック。
 
 - 設定したチェック間隔（デフォルト 30 秒）ごとに配信状態を確認します
 - 配信開始を検出すると自動で録音を開始します
-- 録音ファイルは `recordings/` フォルダに保存されます
+- 録音ファイルは `recordings/` フォルダに `ユーザーID_movieID_日時.aac` で保存されます
 
 ### 4. 録音を停止する
 
-**■ 停止** ボタンをクリックします。配信が終了した場合は yt-dlp が自動的に録音を終了します。
+**■ 停止** ボタンをクリック。配信が終了した場合は yt-dlp が自動的に録音を終了します。
 
 ---
 
 ## ファイル構成
 
 ```
-ツイキャス録音君_20260331/
-├── main.py              # メインアプリケーション
-├── requirements.txt     # Python 依存パッケージ
+twitcas-recorder/
+├── ツイキャス録音君.exe   # 実行ファイル (C#, 32 KB)
+├── ツイキャス録音君.cs    # C# ソースコード
+├── build.bat             # C# 再コンパイル用スクリプト
+├── main.py               # Python 版ソースコード
+├── requirements.txt      # Python 版依存パッケージ
 ├── README.md
 ├── .gitignore
-├── config.json          # 設定ファイル（初回起動時に自動生成）
-├── cookies.json         # ログインクッキー（自動生成・Git管理外）
-├── cookies.txt          # Netscape 形式クッキー（yt-dlp 用・自動生成）
-├── recorder.log         # ログファイル（自動生成）
-└── recordings/          # 録音ファイル保存先（自動生成）
+│
+│   ── 以下は起動時に自動生成 ──
+├── config.json           # 設定ファイル (Git管理外)
+├── cookies.json          # ログインクッキー (Git管理外)
+├── cookies.txt           # Netscape形式クッキー・yt-dlp用 (Git管理外)
+├── recorder.log          # ログファイル (Git管理外)
+└── recordings/           # 録音ファイル保存先 (Git管理外)
 ```
 
 ---
@@ -122,22 +147,31 @@ Twitter/X・Google などの OAuth ログインを使っている場合はこち
 
 ```json
 {
-  "streamers": [
+  "Streamers": [
     {
-      "user_id": "example",
-      "display_name": "サンプル配信者",
-      "password": "合言葉（不要な場合は空文字）",
-      "enabled": true
+      "UserId": "example",
+      "DisplayName": "サンプル配信者",
+      "Password": "合言葉（不要な場合は空文字）",
+      "Enabled": true
     }
   ],
-  "account": {
-    "username": ""
-  },
-  "output_dir": "recordings",
-  "check_interval": 30,
-  "ytdlp_path": "yt-dlp",
-  "ffmpeg_path": "ffmpeg"
+  "AccountUsername": "",
+  "OutputDir": "recordings",
+  "CheckInterval": 30,
+  "YtdlpPath": "yt-dlp",
+  "FfmpegPath": "ffmpeg"
 }
+```
+
+---
+
+## C# 版の再コンパイル
+
+`build.bat` をダブルクリックするだけで `ツイキャス録音君.exe` が再生成されます。
+Visual Studio・.NET SDK は不要です（Windows 標準の `csc.exe` を使用）。
+
+```bat
+build.bat
 ```
 
 ---
@@ -150,13 +184,12 @@ Twitter/X・Google などの OAuth ログインを使っている場合はこち
 pip install yt-dlp
 ```
 
-`yt-dlp` コマンドのパスが通っていない場合は、「詳細設定」タブの「yt-dlp パス」に絶対パスを入力してください。
+PATH が通っていない場合は「詳細設定」タブの「yt-dlp パス」に絶対パスを入力してください。
 
 ### メンバーシップ限定配信が録音できない
 
-- アカウント設定でログインしているか確認してください
-- TC アカウントでのログインが失敗する場合は、**ブラウザの Cookie を貼り付ける方法（方法 B）** をお試しください
-- Cookie の有効期限が切れている場合は、再度貼り付けてください
+- アカウント設定で Cookie をセットしているか確認してください
+- Cookie の有効期限が切れていないか確認してください（ブラウザで再ログイン後に再取得）
 
 ### パスワード保護配信が録音できない
 
@@ -175,5 +208,5 @@ pip install yt-dlp
 ## 動作確認環境
 
 - Windows 11
-- Python 3.11
-- yt-dlp 2024.x
+- .NET Framework 4.8（Windows 標準搭載）
+- yt-dlp 2024.x 以降
