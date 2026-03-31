@@ -1,0 +1,19 @@
+# 認証情報・クッキー (セキュリティのためGit管理対象外)
+cookies.json
+cookies.txt
+config.json
+
+# 録音ファイル
+recordings/
+
+# ログ
+*.log
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# Windows
+Thumbs.db
+Desktop.ini
