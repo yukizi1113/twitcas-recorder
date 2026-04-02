@@ -1198,9 +1198,8 @@ namespace TwitCasRecorder
             _btnStart.Enabled = false; _btnStop.Enabled = true;
             _lblMonitorStatus.Text      = "監視中 (" + enabled.Count + " 名)";
             _lblMonitorStatus.ForeColor = Color.Green;
-            Log("監視開始 — " + enabled.Count + " 名を " + _config.CheckInterval + " 秒ごとにチェック");
-
             new Thread(MonitorLoop) { IsBackground = true }.Start();
+            Log("監視開始 — " + enabled.Count + " 名を " + _config.CheckInterval + " 秒ごとにチェック");
         }
 
         private void StopMonitoring()
@@ -1290,10 +1289,15 @@ namespace TwitCasRecorder
 
         private void Log(string msg)
         {
+            if (_rtbLog == null) return;
+            try
+            {
             if (_rtbLog.InvokeRequired)
             { _rtbLog.Invoke(new Action<string>(Log), msg); return; }
             _rtbLog.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\n");
-            _rtbLog.ScrollToCaret();
+            try { _rtbLog.ScrollToCaret(); } catch { }
+            }
+            catch { }
         }
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
