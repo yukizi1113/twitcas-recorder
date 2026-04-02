@@ -395,23 +395,23 @@ namespace TwitCasRecorder
                 using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                     html = sr.ReadToEnd();
 
-                // パターン1: "is_on_live":true
-                if (html.IndexOf("\"is_on_live\":true", StringComparison.Ordinal) >= 0 ||
-                    html.IndexOf("\"isOnLive\":true",   StringComparison.Ordinal) >= 0)
+                // パターン1: data-is-onlive="true" (TwitCasting の実際のHTML属性)
+                if (html.IndexOf("data-is-onlive=\"true\"", StringComparison.Ordinal) >= 0)
                 {
                     info.IsOnLive = true;
                 }
 
-                // パターン2: data-is-on-live="1"
+                // パターン2: "is_on_live":true (JSON埋め込み)
                 if (!info.IsOnLive &&
-                    html.IndexOf("data-is-on-live=\"1\"", StringComparison.Ordinal) >= 0)
+                    (html.IndexOf("\"is_on_live\":true", StringComparison.Ordinal) >= 0 ||
+                     html.IndexOf("\"isOnLive\":true",   StringComparison.Ordinal) >= 0))
                 {
                     info.IsOnLive = true;
                 }
 
-                // パターン3: 配信中バッジ "tc-badge-live"
+                // パターン3: tcviewer://live/{userId} (メタタグ)
                 if (!info.IsOnLive &&
-                    html.IndexOf("tc-badge-live", StringComparison.Ordinal) >= 0)
+                    html.IndexOf("tcviewer://live/", StringComparison.Ordinal) >= 0)
                 {
                     info.IsOnLive = true;
                 }
