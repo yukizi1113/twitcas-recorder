@@ -225,7 +225,7 @@ namespace TwitCasRecorder
                 sb.AppendLine(domain + "\tTRUE\t" + c.Path + "\t"
                     + (c.Secure ? "TRUE" : "FALSE") + "\t0\t" + c.Name + "\t" + c.Value);
             }
-            File.WriteAllText(NetscapeCookiePath(), sb.ToString(), Encoding.UTF8);
+            File.WriteAllText(NetscapeCookiePath(), sb.ToString(), new UTF8Encoding(false));
         }
 
         private string GetPage(string url)
@@ -405,13 +405,6 @@ namespace TwitCasRecorder
                 if (!info.IsOnLive &&
                     (html.IndexOf("\"is_on_live\":true", StringComparison.Ordinal) >= 0 ||
                      html.IndexOf("\"isOnLive\":true",   StringComparison.Ordinal) >= 0))
-                {
-                    info.IsOnLive = true;
-                }
-
-                // パターン3: tcviewer://live/{userId} (メタタグ)
-                if (!info.IsOnLive &&
-                    html.IndexOf("tcviewer://live/", StringComparison.Ordinal) >= 0)
                 {
                     info.IsOnLive = true;
                 }
