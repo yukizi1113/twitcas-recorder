@@ -359,7 +359,8 @@ namespace TwitCasRecorder
                 var resp = ex.Response as HttpWebResponse;
                 if (resp != null && resp.StatusCode == HttpStatusCode.NotFound)
                 {
-                    // 404 = 配信していない (正常)
+                    // 404 = API では配信なし → メンバーシップ限定の可能性があるので HTML で再確認
+                    CheckLiveViaHtml(userId, info);
                 }
                 else if (resp != null && resp.StatusCode == HttpStatusCode.Unauthorized)
                 {
@@ -379,6 +380,66 @@ namespace TwitCasRecorder
                 _log("[API エラー] " + userId + " : " + ex.Message);
             }
             return info;
+        }
+
+        // Cookie 認証でページ HTML を取得し、ライブ中かどうかを判定
+        // メンバーシップ限定配信など API が 404 を返す場合のフォールバック
+        private void CheckLiveViaHtml(string userId, LiveInfo info)
+        {
+            try
+            {
+                var req = _auth.CreateAuthRequest("https://twitcasting.tv/" + userId);
+                req.Method = "GET";
+                string html;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    html = sr.ReadToEnd();
+
+                // パターン1: "is_on_live":true
+                if (html.IndexOf("\"is_on_live\":true", StringComparison.Ordinal) >= 0 ||
+                    html.IndexOf("\"isOnLive\":true",   StringComparison.Ordinal) >= 0)
+                {
+                    info.IsOnLive = true;
+                }
+
+                // パターン2: data-is-on-live="1"
+                if (!info.IsOnLive &&
+                    html.IndexOf("data-is-on-live=\"1\"", StringComparison.Ordinal) >= 0)
+                {
+                    info.IsOnLive = true;
+                }
+
+                // パターン3: 配信中バッジ "tc-badge-live"
+                if (!info.IsOnLive &&
+                    html.IndexOf("tc-badge-live", StringComparison.Ordinal) >= 0)
+                {
+                    info.IsOnLive = true;
+                }
+
+                // movie_id の抽出 (例: "movie_id":"833248531" または data-movie-id="...")
+                if (info.IsOnLive && info.MovieId == "")
+                {
+                    info.MovieId = ExtractMovieId(html);
+                }
+            }
+            catch { }
+        }
+
+        private static string ExtractMovieId(string html)
+        {
+            string[] patterns = new string[]
+            {
+                "\"movie_id\":\"", "\"movieId\":\"", "data-movie-id=\""
+            };
+            foreach (string pat in patterns)
+            {
+                int s = html.IndexOf(pat, StringComparison.Ordinal);
+                if (s < 0) continue;
+                s += pat.Length;
+                int e = html.IndexOfAny(new char[] { '"', '\'', ' ', '>' }, s);
+                if (e > s) return html.Substring(s, e - s);
+            }
+            return "";
         }
     }
 
