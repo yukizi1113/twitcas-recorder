@@ -612,19 +612,26 @@ namespace TwitCasRecorder
             string ts       = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string baseName = userId + "_" + movieId + "_" + ts;
             string outTmpl  = Path.Combine(_config.OutputDir, baseName + ".%(ext)s");
-            string url      = "https://twitcasting.tv/" + userId;
+            // movieId が判明している場合は直接 movie URL を使う (より確実)
+            string url = (!string.IsNullOrEmpty(movieId))
+                ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
+                : "https://twitcasting.tv/" + userId;
 
             var sb = new StringBuilder();
             sb.Append("--no-playlist --no-part ");
             sb.Append("-x --audio-format aac --audio-quality 0 ");
+            // ffmpeg パスを明示指定（PATH 未登録の場合でも動作するよう）
+            if (!string.IsNullOrEmpty(_config.FfmpegPath))
+                sb.Append("--ffmpeg-location \"" + _config.FfmpegPath + "\" ");
             sb.Append("-o \"" + outTmpl + "\" ");
-            if (_auth.IsLoggedIn && File.Exists(_auth.NetscapeCookiePath()))
+            // IsLoggedIn に関わらず cookies.txt が存在すれば渡す
+            if (File.Exists(_auth.NetscapeCookiePath()))
                 sb.Append("--cookies \"" + _auth.NetscapeCookiePath() + "\" ");
             if (!string.IsNullOrEmpty(password))
                 sb.Append("--video-password \"" + password + "\" ");
             sb.Append("\"" + url + "\"");
 
-            _log("[録音開始] " + userId);
+            _log("[録音開始] " + userId + "  url=" + url);
 
             var psi = new ProcessStartInfo();
             psi.FileName               = _config.YtdlpPath;
