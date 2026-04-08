@@ -8,6 +8,7 @@
 //     /utf8output /optimize+ ツイキャス録音君.cs
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -571,6 +572,20 @@ namespace TwitCasRecorder
     // ============================================================
     class StreamRecorder
     {
+        class ResolvedStreamSource
+        {
+            public string Url { get; set; }
+            public string Cookies { get; set; }
+            public Dictionary<string, string> Headers { get; private set; }
+
+            public ResolvedStreamSource()
+            {
+                Url     = "";
+                Cookies = "";
+                Headers = new Dictionary<string, string>();
+            }
+        }
+
         private readonly AppConfig _config;
         private readonly TwitCastingAuth _auth;
         private readonly Action<string> _log;
@@ -611,27 +626,117 @@ namespace TwitCasRecorder
         {
             string ts       = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string baseName = userId + "_" + movieId + "_" + ts;
-            string outTmpl  = Path.Combine(_config.OutputDir, baseName + ".%(ext)s");
+            string outPath  = Path.Combine(_config.OutputDir, baseName + ".aac");
             // movieId が判明している場合は直接 movie URL を使う (より確実)
             string url = (!string.IsNullOrEmpty(movieId))
                 ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
                 : "https://twitcasting.tv/" + userId;
 
+            try
+            {
+                ResolvedStreamSource src = ResolveStreamSource(url, password);
+                if (src == null || string.IsNullOrEmpty(src.Url))
+                {
+                    _log("[録音] m3u8 を取得できなかったため旧方式にフォールバックします: " + userId);
+                    RecordViaYtDlpFallback(userId, url, password, baseName);
+                    return;
+                }
+
+                _log("[録音開始] " + userId + "  url=" + src.Url);
+
+                var ff = new StringBuilder();
+                ff.Append("-y -nostdin -loglevel info ");
+                if (!string.IsNullOrEmpty(src.Cookies))
+                    ff.Append("-cookies \"" + src.Cookies.Replace("\"", "\\\"") + "\" ");
+
+                string ua;
+                if (src.Headers.TryGetValue("User-Agent", out ua) && ua != "")
+                    ff.Append("-user_agent \"" + ua.Replace("\"", "\\\"") + "\" ");
+
+                string headerBlock = BuildHeaderBlock(src.Headers);
+                if (headerBlock != "")
+                    ff.Append("-headers \"" + headerBlock.Replace("\"", "\\\"") + "\" ");
+
+                ff.Append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ");
+                ff.Append("-i \"" + src.Url + "\" ");
+                ff.Append("-map 0:a:0? -vn -c:a copy -f adts ");
+                ff.Append("\"" + outPath + "\"");
+
+                var psi = new ProcessStartInfo();
+                psi.FileName               = _config.FfmpegPath;
+                psi.Arguments              = ff.ToString();
+                psi.UseShellExecute        = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError  = true;
+                psi.CreateNoWindow         = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
+                psi.StandardErrorEncoding  = Encoding.UTF8;
+
+                bool diskFull = false;
+                var proc = Process.Start(psi);
+                lock (_lock) { _active[userId] = proc; }
+
+                proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                    {
+                        if (e.Data.IndexOf("No space left on device", StringComparison.OrdinalIgnoreCase) >= 0)
+                            diskFull = true;
+                        _log("  [" + userId + "] " + e.Data);
+                    }
+                };
+                proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                    {
+                        if (e.Data.IndexOf("No space left on device", StringComparison.OrdinalIgnoreCase) >= 0)
+                            diskFull = true;
+                        _log("  [" + userId + "] " + e.Data);
+                    }
+                };
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();
+
+                lock (_lock) { _active.Remove(userId); }
+
+                bool hasOutput = File.Exists(outPath) && new FileInfo(outPath).Length > 0;
+                if (proc.ExitCode == 0 && hasOutput)
+                {
+                    _log("[録音完了] " + userId);
+                    if (_onRecordComplete != null) _onRecordComplete(outPath);
+                }
+                else
+                {
+                    _log("[録音終了] " + userId + "  (code:" + proc.ExitCode + ")");
+                    if (diskFull)
+                        _log("[エラー] 保存先ドライブの空き容量が不足しています");
+                    else if (!hasOutput)
+                        _log("[エラー] 音声ファイルが生成されませんでした");
+                }
+            }
+            catch (Exception ex)
+            {
+                lock (_lock) { _active.Remove(userId); }
+                bool notFound = ex.Message.Contains("ファイルが見つかりません")
+                             || ex.Message.Contains("cannot find")
+                             || ex.Message.Contains("No such file");
+                if (notFound)
+                    _log("[エラー] yt-dlp または ffmpeg が見つかりません。パスを確認してください。");
+                else
+                    _log("[エラー] " + userId + ": " + ex.Message);
+            }
+        }
+
+        private ResolvedStreamSource ResolveStreamSource(string url, string password)
+        {
             var sb = new StringBuilder();
-            sb.Append("--no-playlist --no-part ");
-            sb.Append("-x --audio-format aac --audio-quality 0 ");
-            // ffmpeg パスを明示指定（PATH 未登録の場合でも動作するよう）
-            if (!string.IsNullOrEmpty(_config.FfmpegPath))
-                sb.Append("--ffmpeg-location \"" + _config.FfmpegPath + "\" ");
-            sb.Append("-o \"" + outTmpl + "\" ");
-            // IsLoggedIn に関わらず cookies.txt が存在すれば渡す
+            sb.Append("-J --no-playlist ");
             if (File.Exists(_auth.NetscapeCookiePath()))
                 sb.Append("--cookies \"" + _auth.NetscapeCookiePath() + "\" ");
             if (!string.IsNullOrEmpty(password))
                 sb.Append("--video-password \"" + password + "\" ");
             sb.Append("\"" + url + "\"");
-
-            _log("[録音開始] " + userId + "  url=" + url);
 
             var psi = new ProcessStartInfo();
             psi.FileName               = _config.YtdlpPath;
@@ -643,54 +748,159 @@ namespace TwitCasRecorder
             psi.StandardOutputEncoding = Encoding.UTF8;
             psi.StandardErrorEncoding  = Encoding.UTF8;
 
-            try
+            using (var proc = Process.Start(psi))
             {
-                var proc = Process.Start(psi);
-                lock (_lock) { _active[userId] = proc; }
-
-                proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
-                {
-                    if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
-                        _log("  [" + userId + "] " + e.Data);
-                };
-                proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
-                {
-                    if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
-                        _log("  [" + userId + "] " + e.Data);
-                };
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
+                string json = proc.StandardOutput.ReadToEnd();
+                string err  = proc.StandardError.ReadToEnd();
                 proc.WaitForExit();
 
-                lock (_lock) { _active.Remove(userId); }
+                if (proc.ExitCode != 0)
+                    throw new InvalidOperationException(
+                        string.IsNullOrWhiteSpace(err) ? "yt-dlp metadata resolve failed" : err.Trim());
 
-                if (proc.ExitCode == 0)
+                var ser = new JavaScriptSerializer();
+                ser.MaxJsonLength = int.MaxValue;
+                var root = ser.Deserialize<Dictionary<string, object>>(json);
+                return PickBestM3u8Format(root);
+            }
+        }
+
+        private ResolvedStreamSource PickBestM3u8Format(Dictionary<string, object> root)
+        {
+            Dictionary<string, object> best = null;
+            int bestQuality = int.MinValue;
+
+            object formatsObj;
+            if (!root.TryGetValue("formats", out formatsObj))
+                return null;
+
+            var formats = formatsObj as ArrayList;
+            if (formats == null) return null;
+
+            foreach (object item in formats)
+            {
+                var fmt = item as Dictionary<string, object>;
+                if (fmt == null) continue;
+
+                string protocol = DictStr(fmt, "protocol");
+                string streamUrl = DictStr(fmt, "url");
+                if (streamUrl == "" || !protocol.StartsWith("m3u8", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                int quality = DictInt(fmt, "quality", -1);
+                if (best == null || quality >= bestQuality)
                 {
-                    _log("[録音完了] " + userId);
-                    // 実際に出力されたファイルを探してコールバック
-                    if (_onRecordComplete != null)
-                    {
-                        string[] found = Directory.GetFiles(
-                            _config.OutputDir, baseName + ".*");
-                        if (found.Length > 0)
-                            _onRecordComplete(found[0]);
-                    }
-                }
-                else
-                {
-                    _log("[録音終了] " + userId + "  (code:" + proc.ExitCode + ")");
+                    best = fmt;
+                    bestQuality = quality;
                 }
             }
-            catch (Exception ex)
+
+            if (best == null) return null;
+
+            var src = new ResolvedStreamSource();
+            src.Url = DictStr(best, "url");
+            src.Cookies = DictStr(best, "cookies");
+
+            object headersObj;
+            if (best.TryGetValue("http_headers", out headersObj))
             {
-                lock (_lock) { _active.Remove(userId); }
-                bool notFound = ex.Message.Contains("ファイルが見つかりません")
-                             || ex.Message.Contains("cannot find")
-                             || ex.Message.Contains("No such file");
-                if (notFound)
-                    _log("[エラー] yt-dlp が見つかりません。pip install yt-dlp を実行してください。");
-                else
-                    _log("[エラー] " + userId + ": " + ex.Message);
+                var headers = headersObj as Dictionary<string, object>;
+                if (headers != null)
+                {
+                    foreach (var kv in headers)
+                        src.Headers[kv.Key] = kv.Value != null ? kv.Value.ToString() : "";
+                }
+            }
+            return src;
+        }
+
+        private string BuildHeaderBlock(Dictionary<string, string> headers)
+        {
+            var sb = new StringBuilder();
+            foreach (var kv in headers)
+            {
+                if (kv.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.IsNullOrEmpty(kv.Value)) continue;
+                sb.Append(kv.Key).Append(": ").Append(kv.Value).Append("\r\n");
+            }
+            return sb.ToString();
+        }
+
+        private static string DictStr(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d != null && d.TryGetValue(key, out v) && v != null)
+                return v.ToString();
+            return "";
+        }
+
+        private static int DictInt(Dictionary<string, object> d, string key, int def)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(key, out v) || v == null)
+                return def;
+            try { return Convert.ToInt32(v); }
+            catch { return def; }
+        }
+
+        private void RecordViaYtDlpFallback(string userId, string url, string password, string baseName)
+        {
+            string outTmpl = Path.Combine(_config.OutputDir, baseName + ".%(ext)s");
+            var sb = new StringBuilder();
+            sb.Append("--no-playlist --no-part ");
+            sb.Append("-x --audio-format aac --audio-quality 0 ");
+            if (!string.IsNullOrEmpty(_config.FfmpegPath))
+                sb.Append("--ffmpeg-location \"" + _config.FfmpegPath + "\" ");
+            sb.Append("-o \"" + outTmpl + "\" ");
+            if (File.Exists(_auth.NetscapeCookiePath()))
+                sb.Append("--cookies \"" + _auth.NetscapeCookiePath() + "\" ");
+            if (!string.IsNullOrEmpty(password))
+                sb.Append("--video-password \"" + password + "\" ");
+            sb.Append("\"" + url + "\"");
+
+            var psi = new ProcessStartInfo();
+            psi.FileName               = _config.YtdlpPath;
+            psi.Arguments              = sb.ToString();
+            psi.UseShellExecute        = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError  = true;
+            psi.CreateNoWindow         = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            psi.StandardErrorEncoding  = Encoding.UTF8;
+
+            var proc = Process.Start(psi);
+            lock (_lock) { _active[userId] = proc; }
+
+            proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                    _log("  [" + userId + "] " + e.Data);
+            };
+            proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                    _log("  [" + userId + "] " + e.Data);
+            };
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            proc.WaitForExit();
+
+            lock (_lock) { _active.Remove(userId); }
+
+            if (proc.ExitCode == 0)
+            {
+                _log("[録音完了] " + userId);
+                if (_onRecordComplete != null)
+                {
+                    string[] found = Directory.GetFiles(
+                        _config.OutputDir, baseName + ".*");
+                    if (found.Length > 0)
+                        _onRecordComplete(found[0]);
+                }
+            }
+            else
+            {
+                _log("[録音終了] " + userId + "  (code:" + proc.ExitCode + ")");
             }
         }
 

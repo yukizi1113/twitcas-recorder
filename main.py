@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             config = json.load(f)
         for key, val in DEFAULT_CONFIG.items():
             if key not in config:
@@ -170,7 +170,7 @@ class TwitCastingAuth:
         if not COOKIES_JSON_FILE.exists():
             return False
         try:
-            with open(COOKIES_JSON_FILE, "r", encoding="utf-8") as f:
+            with open(COOKIES_JSON_FILE, "r", encoding="utf-8-sig") as f:
                 cookies_data = json.load(f)
             for c in cookies_data:
                 self.session.cookies.set(
@@ -254,7 +254,7 @@ class StreamMonitor:
 # ============================================================
 
 class StreamRecorder:
-    """yt-dlp を使って TwitCasting 配信の音声を録音する"""
+    """Resolve live HLS with yt-dlp and capture audio-only AAC with ffmpeg."""
 
     def __init__(self, config: dict, auth: TwitCastingAuth, log_callback=None):
         self.config = config
@@ -286,48 +286,63 @@ class StreamRecorder:
 
         movie_id = str(movie_info.get("id", "unknown"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_tmpl = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.%(ext)s")
+        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.aac")
 
         t = threading.Thread(
             target=self._record,
-            args=(user_id, movie_id, out_tmpl, password),
+            args=(user_id, movie_id, out_path, password),
             daemon=True,
         )
         t.start()
 
-    def _record(self, user_id: str, movie_id: str, out_tmpl: str, password: str):
-        stream_url = f"https://twitcasting.tv/{user_id}"
-        ytdlp = self.config.get("ytdlp_path", "yt-dlp")
-
-        cmd = [
-            ytdlp,
-            "--no-playlist",
-            "--no-part",
-            "-x",                    # 音声のみ抽出
-            "--audio-format", "aac",
-            "--audio-quality", "0",
-            "-o", out_tmpl,
-        ]
-
-        # ログイン済みなら Cookie を渡す (メンバーシップ限定配信用)
-        if self.auth.is_logged_in and NETSCAPE_COOKIES_FILE.exists():
-            cmd += ["--cookies", str(NETSCAPE_COOKIES_FILE)]
-
-        # パスワード保護配信
-        if password:
-            cmd += ["--video-password", password]
-
-        cmd.append(stream_url)
-
-        self._log(f"[録音開始] {user_id}  →  {Path(out_tmpl).parent.name}/...")
+    def _record(self, user_id: str, movie_id: str, out_path: str, password: str):
+        stream_url = (
+            f"https://twitcasting.tv/{user_id}/movie/{movie_id}"
+            if movie_id and movie_id != "unknown"
+            else f"https://twitcasting.tv/{user_id}"
+        )
 
         try:
-            CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+            source = self._resolve_stream_source(stream_url, password)
+            if not source or not source.get("url"):
+                self._log(f"[録音] m3u8 を取得できなかったため旧方式にフォールバックします: {user_id}")
+                self._record_via_ytdlp_fallback(user_id, stream_url, out_path, password)
+                return
+
+            ffmpeg = self.config.get("ffmpeg_path", "ffmpeg")
+            cmd = [ffmpeg, "-y", "-nostdin", "-loglevel", "info"]
+
+            if source.get("cookies"):
+                cmd += ["-cookies", source["cookies"]]
+
+            user_agent = source["headers"].get("User-Agent")
+            if user_agent:
+                cmd += ["-user_agent", user_agent]
+
+            header_block = self._build_header_block(source["headers"])
+            if header_block:
+                cmd += ["-headers", header_block]
+
+            cmd += [
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-i", source["url"],
+                "-map", "0:a:0?",
+                "-vn",
+                "-c:a", "copy",
+                "-f", "adts",
+                out_path,
+            ]
+
+            self._log(f"[録音開始] {user_id}  url={source['url']}")
+
+            create_no_window = 0x08000000 if sys.platform == "win32" else 0
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                creationflags=CREATE_NO_WINDOW,
+                creationflags=create_no_window,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -335,9 +350,12 @@ class StreamRecorder:
             with self._lock:
                 self._active[user_id] = proc
 
+            disk_full = False
             for line in proc.stdout:
                 line = line.rstrip()
                 if line and not line.startswith("[debug]"):
+                    if "No space left on device" in line:
+                        disk_full = True
                     self._log(f"  [{user_id}] {line}")
 
             proc.wait()
@@ -345,22 +363,131 @@ class StreamRecorder:
             with self._lock:
                 self._active.pop(user_id, None)
 
-            if proc.returncode == 0:
+            has_output = Path(out_path).exists() and Path(out_path).stat().st_size > 0
+            if proc.returncode == 0 and has_output:
                 self._log(f"[録音完了] {user_id}")
             else:
                 self._log(f"[録音終了] {user_id}  (終了コード: {proc.returncode})")
+                if disk_full:
+                    self._log("[エラー] 保存先ドライブの空き容量が不足しています")
+                elif not has_output:
+                    self._log("[エラー] 音声ファイルが生成されませんでした")
 
         except FileNotFoundError:
-            self._log(
-                "[エラー] yt-dlp が見つかりません。"
-                "コマンドプロンプトで  pip install yt-dlp  を実行してください。"
-            )
+            self._log("[エラー] yt-dlp または ffmpeg が見つかりません。パスを確認してください。")
             with self._lock:
                 self._active.pop(user_id, None)
         except Exception as e:
             self._log(f"[エラー] {user_id}: {e}")
             with self._lock:
                 self._active.pop(user_id, None)
+
+    def _resolve_stream_source(self, stream_url: str, password: str) -> dict | None:
+        ytdlp = self.config.get("ytdlp_path", "yt-dlp")
+        cmd = [ytdlp, "-J", "--no-playlist"]
+
+        if NETSCAPE_COOKIES_FILE.exists():
+            cmd += ["--cookies", str(NETSCAPE_COOKIES_FILE)]
+        if password:
+            cmd += ["--video-password", password]
+        cmd.append(stream_url)
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=0x08000000 if sys.platform == "win32" else 0,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or "yt-dlp metadata resolve failed"
+            raise RuntimeError(detail)
+
+        info = json.loads(result.stdout)
+        best = None
+        best_quality = -10**9
+        for fmt in info.get("formats", []):
+            if not str(fmt.get("protocol", "")).startswith("m3u8"):
+                continue
+            if not fmt.get("url"):
+                continue
+            quality = fmt.get("quality")
+            try:
+                quality = int(quality)
+            except (TypeError, ValueError):
+                quality = -1
+            if best is None or quality >= best_quality:
+                best = fmt
+                best_quality = quality
+
+        if not best:
+            return None
+
+        return {
+            "url": best.get("url", ""),
+            "cookies": best.get("cookies", ""),
+            "headers": dict(best.get("http_headers") or {}),
+        }
+
+    def _build_header_block(self, headers: dict) -> str:
+        parts = []
+        for key, value in headers.items():
+            if key.lower() == "user-agent":
+                continue
+            if value:
+                parts.append(f"{key}: {value}")
+        return "\r\n".join(parts) + ("\r\n" if parts else "")
+
+    def _record_via_ytdlp_fallback(self, user_id: str, stream_url: str, out_path: str, password: str):
+        ytdlp = self.config.get("ytdlp_path", "yt-dlp")
+        out_tmpl = str(Path(out_path).with_suffix(".%(ext)s"))
+        cmd = [
+            ytdlp,
+            "--no-playlist",
+            "--no-part",
+            "-x",
+            "--audio-format", "aac",
+            "--audio-quality", "0",
+            "-o", out_tmpl,
+        ]
+        if NETSCAPE_COOKIES_FILE.exists():
+            cmd += ["--cookies", str(NETSCAPE_COOKIES_FILE)]
+        if password:
+            cmd += ["--video-password", password]
+        ffmpeg = self.config.get("ffmpeg_path", "ffmpeg")
+        if ffmpeg:
+            cmd += ["--ffmpeg-location", ffmpeg]
+        cmd.append(stream_url)
+
+        create_no_window = 0x08000000 if sys.platform == "win32" else 0
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=create_no_window,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        with self._lock:
+            self._active[user_id] = proc
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line and not line.startswith("[debug]"):
+                self._log(f"  [{user_id}] {line}")
+
+        proc.wait()
+
+        with self._lock:
+            self._active.pop(user_id, None)
+
+        if proc.returncode == 0:
+            self._log(f"[録音完了] {user_id}")
+        else:
+            self._log(f"[録音終了] {user_id}  (終了コード: {proc.returncode})")
 
     def stop_recording(self, user_id: str):
         with self._lock:
