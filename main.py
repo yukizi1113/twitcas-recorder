@@ -10,6 +10,8 @@ TwitCasting Stream Audio Recorder
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 import json
+import html
+import re
 import threading
 import time
 import logging
@@ -19,6 +21,7 @@ import sys
 import requests
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # ============================================================
 # パス定義
@@ -200,18 +203,45 @@ class TwitCastingAuth:
 
     # ---- パスワード配信の解錠 ----
 
-    def unlock_password_stream(self, movie_id: str, password: str) -> bool:
+    def unlock_password_stream(self, user_id: str, movie_id: str, password: str) -> bool:
         """パスワード保護配信を解錠する"""
+        legacy_ok = False
+
         try:
-            r = self.session.post(
-                self.CHECK_PASS_URL,
-                data={"movie_id": movie_id, "password": password},
-                headers={"Referer": "https://twitcasting.tv/"},
+            if movie_id:
+                r = self.session.post(
+                    self.CHECK_PASS_URL,
+                    data={"movie_id": movie_id, "password": password},
+                    headers={"Referer": "https://twitcasting.tv/"},
+                    timeout=10,
+                )
+                legacy_ok = r.status_code == 200
+        except Exception:
+            legacy_ok = False
+
+        try:
+            page_url = f"https://twitcasting.tv/{user_id}"
+            page = self.session.get(page_url, timeout=10)
+            m = re.search(r'name="cs_session_id"\s+value="([^"]+)"', page.text)
+            if not m:
+                if legacy_ok:
+                    self._persist_cookies()
+                return legacy_ok
+
+            unlocked = self.session.post(
+                page_url,
+                data={"password": password, "cs_session_id": m.group(1)},
+                headers={"Referer": page_url},
                 timeout=10,
             )
-            return r.status_code == 200
+            ok = "tc-page-variables" in unlocked.text
+            if ok or legacy_ok:
+                self._persist_cookies()
+            return ok or legacy_ok
         except Exception:
-            return False
+            if legacy_ok:
+                self._persist_cookies()
+            return legacy_ok
 
     def get_session(self):
         return self.session
@@ -303,7 +333,7 @@ class StreamRecorder:
         )
 
         try:
-            source = self._resolve_stream_source(stream_url, password)
+            source = self._resolve_stream_source(user_id, movie_id, stream_url, password)
             if not source or not source.get("url"):
                 self._log(f"[録音] m3u8 を取得できなかったため旧方式にフォールバックします: {user_id}")
                 self._record_via_ytdlp_fallback(user_id, stream_url, out_path, password)
@@ -382,7 +412,67 @@ class StreamRecorder:
             with self._lock:
                 self._active.pop(user_id, None)
 
-    def _resolve_stream_source(self, stream_url: str, password: str) -> dict | None:
+    def _resolve_stream_source(self, user_id: str, movie_id: str, stream_url: str, password: str) -> dict | None:
+        try:
+            direct = self._resolve_stream_source_direct(user_id, movie_id, password)
+        except Exception:
+            direct = None
+        if direct and direct.get("url"):
+            return direct
+        return self._resolve_stream_source_via_ytdlp(stream_url, password)
+
+    def _resolve_stream_source_direct(self, user_id: str, movie_id: str, password: str) -> dict | None:
+        session = self.auth.get_session()
+        page_url = f"https://twitcasting.tv/{user_id}"
+
+        page = session.get(page_url, timeout=15)
+        html_text = page.text
+        if password:
+            m = re.search(r'name="cs_session_id"\s+value="([^"]+)"', html_text)
+            if m:
+                page = session.post(
+                    page_url,
+                    data={"password": password, "cs_session_id": m.group(1)},
+                    headers={"Referer": page_url},
+                    timeout=15,
+                )
+                html_text = page.text
+
+        m = re.search(r'<meta name="tc-page-variables" content="([^"]+)"', html_text)
+        if not m:
+            return None
+
+        page_vars = json.loads(html.unescape(m.group(1)))
+        broadcaster_id = page_vars.get("broadcaster_id") or user_id
+        pass_code = page_vars.get("pass_code") or ""
+
+        streamserver = session.get(
+            f"https://twitcasting.tv/streamserver.php?target={broadcaster_id}&mode=client&player=pc_web",
+            headers={"Referer": page_url},
+            timeout=15,
+        )
+        streamserver.raise_for_status()
+        info = streamserver.json()
+
+        streams = ((info.get("tc-hls") or {}).get("streams") or {})
+        stream_url = streams.get("high") or streams.get("medium") or streams.get("low") or ""
+        if not stream_url:
+            return None
+
+        if pass_code:
+            stream_url = self._append_query_param(stream_url, "word", pass_code)
+
+        return {
+            "url": stream_url,
+            "cookies": self._session_cookie_header(),
+            "headers": {
+                "User-Agent": session.headers.get("User-Agent", ""),
+                "Origin": "https://twitcasting.tv",
+                "Referer": "https://twitcasting.tv/",
+            },
+        }
+
+    def _resolve_stream_source_via_ytdlp(self, stream_url: str, password: str) -> dict | None:
         ytdlp = self.config.get("ytdlp_path", "yt-dlp")
         cmd = [ytdlp, "-J", "--no-playlist"]
 
@@ -403,6 +493,11 @@ class StreamRecorder:
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or "yt-dlp metadata resolve failed"
+            if "Failed to extract" in detail or "[PYI-" in detail:
+                detail = (
+                    "yt-dlp.exe の展開に失敗しました。TEMP の空き容量不足か "
+                    "スタンドアロン版の破損が疑われます"
+                )
             raise RuntimeError(detail)
 
         info = json.loads(result.stdout)
@@ -430,6 +525,26 @@ class StreamRecorder:
             "cookies": best.get("cookies", ""),
             "headers": dict(best.get("http_headers") or {}),
         }
+
+    def _session_cookie_header(self) -> str:
+        cookies = []
+        for c in self.auth.get_session().cookies:
+            domain = c.domain or ""
+            if "twitcasting.tv" in domain or domain == "":
+                cookies.append(f"{c.name}={c.value}")
+        return "; ".join(cookies)
+
+    def _append_query_param(self, url: str, key: str, value: str) -> str:
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query[key] = value
+        return urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(query),
+            parsed.fragment,
+        ))
 
     def _build_header_block(self, headers: dict) -> str:
         parts = []
@@ -888,7 +1003,7 @@ class App(tk.Tk):
                     if is_protected:
                         if pw:
                             self._log(f"[パスワード認証] {uid}")
-                            unlocked = self.auth.unlock_password_stream(movie_id, pw)
+                            unlocked = self.auth.unlock_password_stream(uid, movie_id, pw)
                             if not unlocked:
                                 self._log(f"[警告] {uid}: パスワード認証に失敗しました")
                         else:

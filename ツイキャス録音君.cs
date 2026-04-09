@@ -15,6 +15,7 @@ using System.Drawing;
 using System.IO;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
@@ -160,22 +161,58 @@ namespace TwitCasRecorder
             catch { return false; }
         }
 
-        public bool UnlockPasswordStream(string movieId, string password)
+        public bool UnlockPasswordStream(string userId, string movieId, string password)
         {
+            bool legacyOk = false;
             try
             {
-                string post = "movie_id=" + Uri.EscapeDataString(movieId)
-                            + "&password=" + Uri.EscapeDataString(password);
-                PostPage("https://twitcasting.tv/checkpassword.php", post,
-                         "https://twitcasting.tv/");
-                return true;
+                if (!string.IsNullOrEmpty(movieId))
+                {
+                    string post = "movie_id=" + Uri.EscapeDataString(movieId)
+                                + "&password=" + Uri.EscapeDataString(password);
+                    PostPage("https://twitcasting.tv/checkpassword.php", post,
+                             "https://twitcasting.tv/");
+                    legacyOk = true;
+                }
             }
-            catch { return false; }
+            catch { legacyOk = false; }
+
+            try
+            {
+                string pageUrl = "https://twitcasting.tv/" + userId;
+                string html = GetPage(pageUrl);
+                Match m = Regex.Match(html, "name=\"cs_session_id\"\\s+value=\"([^\"]+)\"");
+                if (!m.Success)
+                {
+                    if (legacyOk) PersistCookies();
+                    return legacyOk;
+                }
+
+                string body = "password=" + Uri.EscapeDataString(password)
+                            + "&cs_session_id=" + Uri.EscapeDataString(m.Groups[1].Value);
+                string unlocked = PostPage(pageUrl, body, pageUrl);
+                bool ok = unlocked.IndexOf("tc-page-variables", StringComparison.Ordinal) >= 0;
+                if (ok || legacyOk) PersistCookies();
+                return ok || legacyOk;
+            }
+            catch
+            {
+                if (legacyOk) PersistCookies();
+                return legacyOk;
+            }
         }
 
         public string NetscapeCookiePath()
         {
             return Path.Combine(AppConfig.AppDir(), "cookies.txt");
+        }
+
+        public string GetCookieHeader()
+        {
+            var list = new List<string>();
+            foreach (Cookie c in _cookies.GetCookies(TcUri))
+                list.Add(c.Name + "=" + c.Value);
+            return string.Join("; ", list.ToArray());
         }
 
         public HttpWebRequest CreateAuthRequest(string url)
@@ -229,7 +266,7 @@ namespace TwitCasRecorder
             File.WriteAllText(NetscapeCookiePath(), sb.ToString(), new UTF8Encoding(false));
         }
 
-        private string GetPage(string url)
+        public string GetPage(string url)
         {
             var req = CreateAuthRequest(url);
             req.Method = "GET";
@@ -238,7 +275,7 @@ namespace TwitCasRecorder
                 return sr.ReadToEnd();
         }
 
-        private void PostPage(string url, string postData, string referer)
+        public string PostPage(string url, string postData, string referer)
         {
             var req = CreateAuthRequest(url);
             req.Method = "POST";
@@ -249,7 +286,7 @@ namespace TwitCasRecorder
             using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
             using (var resp = (HttpWebResponse)req.GetResponse())
             using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                sr.ReadToEnd();
+                return sr.ReadToEnd();
         }
 
         private static string ExtractBetween(string html, string anchor,
@@ -634,7 +671,7 @@ namespace TwitCasRecorder
 
             try
             {
-                ResolvedStreamSource src = ResolveStreamSource(url, password);
+                ResolvedStreamSource src = ResolveStreamSource(userId, movieId, url, password);
                 if (src == null || string.IsNullOrEmpty(src.Url))
                 {
                     _log("[録音] m3u8 を取得できなかったため旧方式にフォールバックします: " + userId);
@@ -728,7 +765,74 @@ namespace TwitCasRecorder
             }
         }
 
-        private ResolvedStreamSource ResolveStreamSource(string url, string password)
+        private ResolvedStreamSource ResolveStreamSource(
+            string userId, string movieId, string url, string password)
+        {
+            ResolvedStreamSource direct = null;
+            try { direct = ResolveStreamSourceDirect(userId, movieId, password); }
+            catch { direct = null; }
+            if (direct != null && direct.Url != "") return direct;
+            return ResolveStreamSourceViaYtDlp(url, password);
+        }
+
+        private ResolvedStreamSource ResolveStreamSourceDirect(
+            string userId, string movieId, string password)
+        {
+            string pageUrl = "https://twitcasting.tv/" + userId;
+
+            string html = _auth.GetPage(pageUrl);
+            if (!string.IsNullOrEmpty(password))
+            {
+                Match form = Regex.Match(html, "name=\"cs_session_id\"\\s+value=\"([^\"]+)\"");
+                if (form.Success)
+                {
+                    string body = "password=" + Uri.EscapeDataString(password)
+                                + "&cs_session_id=" + Uri.EscapeDataString(form.Groups[1].Value);
+                    html = _auth.PostPage(pageUrl, body, pageUrl);
+                }
+            }
+
+            Match meta = Regex.Match(html,
+                "<meta name=\"tc-page-variables\" content=\"([^\"]+)\"");
+            if (!meta.Success) return null;
+
+            string pageVarsJson = WebUtility.HtmlDecode(meta.Groups[1].Value);
+            var ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            var pageVars = ser.Deserialize<Dictionary<string, object>>(pageVarsJson);
+            string broadcasterId = DictStr(pageVars, "broadcaster_id");
+            if (broadcasterId == "") broadcasterId = userId;
+            string passCode = DictStr(pageVars, "pass_code");
+
+            string apiUrl = "https://twitcasting.tv/streamserver.php?target="
+                + Uri.EscapeDataString(broadcasterId)
+                + "&mode=client&player=pc_web";
+            var req = _auth.CreateAuthRequest(apiUrl);
+            req.Method = "GET";
+            req.Referer = pageUrl;
+            string json;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                json = sr.ReadToEnd();
+
+            var root = ser.Deserialize<Dictionary<string, object>>(json);
+            string streamUrl = PickBestDirectM3u8(root);
+            if (streamUrl == "") return null;
+            if (passCode != "")
+                streamUrl = AppendQueryParam(streamUrl, "word", passCode);
+
+            var src = new ResolvedStreamSource();
+            src.Url = streamUrl;
+            src.Cookies = _auth.GetCookieHeader();
+            src.Headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                      + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                      + "Chrome/122.0.0.0 Safari/537.36";
+            src.Headers["Origin"] = "https://twitcasting.tv";
+            src.Headers["Referer"] = "https://twitcasting.tv/";
+            return src;
+        }
+
+        private ResolvedStreamSource ResolveStreamSourceViaYtDlp(string url, string password)
         {
             var sb = new StringBuilder();
             sb.Append("-J --no-playlist ");
@@ -755,17 +859,46 @@ namespace TwitCasRecorder
                 proc.WaitForExit();
 
                 if (proc.ExitCode != 0)
+                {
+                    if (err.IndexOf("Failed to extract", StringComparison.OrdinalIgnoreCase) >= 0
+                     || err.IndexOf("[PYI-", StringComparison.OrdinalIgnoreCase) >= 0)
+                        throw new InvalidOperationException(
+                            "yt-dlp.exe の展開に失敗しました。TEMP の空き容量不足かスタンドアロン版の破損が疑われます");
                     throw new InvalidOperationException(
                         string.IsNullOrWhiteSpace(err) ? "yt-dlp metadata resolve failed" : err.Trim());
+                }
 
                 var ser = new JavaScriptSerializer();
                 ser.MaxJsonLength = int.MaxValue;
                 var root = ser.Deserialize<Dictionary<string, object>>(json);
-                return PickBestM3u8Format(root);
+                return PickBestYtDlpM3u8Format(root);
             }
         }
 
-        private ResolvedStreamSource PickBestM3u8Format(Dictionary<string, object> root)
+        private string PickBestDirectM3u8(Dictionary<string, object> root)
+        {
+            object tcHlsObj;
+            if (!root.TryGetValue("tc-hls", out tcHlsObj))
+                return "";
+
+            var tcHls = tcHlsObj as Dictionary<string, object>;
+            if (tcHls == null) return "";
+
+            object streamsObj;
+            if (!tcHls.TryGetValue("streams", out streamsObj))
+                return "";
+
+            var streams = streamsObj as Dictionary<string, object>;
+            if (streams == null) return "";
+
+            string high = DictStr(streams, "high");
+            if (high != "") return high;
+            string medium = DictStr(streams, "medium");
+            if (medium != "") return medium;
+            return DictStr(streams, "low");
+        }
+
+        private ResolvedStreamSource PickBestYtDlpM3u8Format(Dictionary<string, object> root)
         {
             Dictionary<string, object> best = null;
             int bestQuality = int.MinValue;
@@ -812,6 +945,16 @@ namespace TwitCasRecorder
                 }
             }
             return src;
+        }
+
+        private string AppendQueryParam(string url, string key, string value)
+        {
+            if (url.IndexOf(key + "=", StringComparison.OrdinalIgnoreCase) >= 0)
+                return url;
+            return url + (url.IndexOf('?') >= 0 ? "&" : "?")
+                 + Uri.EscapeDataString(key)
+                 + "="
+                 + Uri.EscapeDataString(value);
         }
 
         private string BuildHeaderBlock(Dictionary<string, string> headers)
@@ -1445,7 +1588,7 @@ namespace TwitCasRecorder
                             if (!string.IsNullOrEmpty(st.Password))
                             {
                                 Log("[パスワード認証] " + st.UserId);
-                                _auth.UnlockPasswordStream(info.MovieId, st.Password);
+                                _auth.UnlockPasswordStream(st.UserId, info.MovieId, st.Password);
                             }
                             else { Log("[スキップ] " + st.UserId + ": パスワード必要ですが未設定"); continue; }
                         }
