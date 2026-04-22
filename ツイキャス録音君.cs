@@ -768,17 +768,33 @@ namespace TwitCasRecorder
         private ResolvedStreamSource ResolveStreamSource(
             string userId, string movieId, string url, string password)
         {
+            bool preferYtDlp = !string.IsNullOrEmpty(movieId);
+            if (preferYtDlp)
+            {
+                try
+                {
+                    ResolvedStreamSource viaYtDlp = ResolveStreamSourceViaYtDlp(url, password);
+                    if (viaYtDlp != null && viaYtDlp.Url != "") return viaYtDlp;
+                }
+                catch { }
+            }
+
             ResolvedStreamSource direct = null;
             try { direct = ResolveStreamSourceDirect(userId, movieId, password); }
             catch { direct = null; }
             if (direct != null && direct.Url != "") return direct;
-            return ResolveStreamSourceViaYtDlp(url, password);
+
+            if (!preferYtDlp)
+                return ResolveStreamSourceViaYtDlp(url, password);
+            return null;
         }
 
         private ResolvedStreamSource ResolveStreamSourceDirect(
             string userId, string movieId, string password)
         {
-            string pageUrl = "https://twitcasting.tv/" + userId;
+            string pageUrl = !string.IsNullOrEmpty(movieId)
+                ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
+                : "https://twitcasting.tv/" + userId;
 
             string html = _auth.GetPage(pageUrl);
             if (!string.IsNullOrEmpty(password))
@@ -900,6 +916,9 @@ namespace TwitCasRecorder
 
         private ResolvedStreamSource PickBestYtDlpM3u8Format(Dictionary<string, object> root)
         {
+            ResolvedStreamSource requested = PickRequestedYtDlpFormat(root);
+            if (requested != null && requested.Url != "") return requested;
+
             Dictionary<string, object> best = null;
             int bestQuality = int.MinValue;
 
@@ -945,6 +964,44 @@ namespace TwitCasRecorder
                 }
             }
             return src;
+        }
+
+        private ResolvedStreamSource PickRequestedYtDlpFormat(Dictionary<string, object> root)
+        {
+            object requestedObj;
+            if (!root.TryGetValue("requested_downloads", out requestedObj))
+                return null;
+
+            var requested = requestedObj as ArrayList;
+            if (requested == null) return null;
+
+            foreach (object item in requested)
+            {
+                var fmt = item as Dictionary<string, object>;
+                if (fmt == null) continue;
+
+                string protocol = DictStr(fmt, "protocol");
+                string streamUrl = DictStr(fmt, "url");
+                if (streamUrl == "" || !protocol.StartsWith("m3u8", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var src = new ResolvedStreamSource();
+                src.Url = streamUrl;
+                src.Cookies = DictStr(fmt, "cookies");
+
+                object headersObj;
+                if (fmt.TryGetValue("http_headers", out headersObj))
+                {
+                    var headers = headersObj as Dictionary<string, object>;
+                    if (headers != null)
+                    {
+                        foreach (var kv in headers)
+                            src.Headers[kv.Key] = kv.Value != null ? kv.Value.ToString() : "";
+                    }
+                }
+                return src;
+            }
+            return null;
         }
 
         private string AppendQueryParam(string url, string key, string value)

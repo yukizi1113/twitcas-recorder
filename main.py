@@ -413,17 +413,32 @@ class StreamRecorder:
                 self._active.pop(user_id, None)
 
     def _resolve_stream_source(self, user_id: str, movie_id: str, stream_url: str, password: str) -> dict | None:
+        prefer_ytdlp = bool(movie_id and movie_id != "unknown")
+        if prefer_ytdlp:
+            try:
+                via_ytdlp = self._resolve_stream_source_via_ytdlp(stream_url, password)
+            except Exception:
+                via_ytdlp = None
+            if via_ytdlp and via_ytdlp.get("url"):
+                return via_ytdlp
+
         try:
             direct = self._resolve_stream_source_direct(user_id, movie_id, password)
         except Exception:
             direct = None
         if direct and direct.get("url"):
             return direct
-        return self._resolve_stream_source_via_ytdlp(stream_url, password)
+        if not prefer_ytdlp:
+            return self._resolve_stream_source_via_ytdlp(stream_url, password)
+        return None
 
     def _resolve_stream_source_direct(self, user_id: str, movie_id: str, password: str) -> dict | None:
         session = self.auth.get_session()
-        page_url = f"https://twitcasting.tv/{user_id}"
+        page_url = (
+            f"https://twitcasting.tv/{user_id}/movie/{movie_id}"
+            if movie_id and movie_id != "unknown"
+            else f"https://twitcasting.tv/{user_id}"
+        )
 
         page = session.get(page_url, timeout=15)
         html_text = page.text
@@ -501,6 +516,17 @@ class StreamRecorder:
             raise RuntimeError(detail)
 
         info = json.loads(result.stdout)
+        for fmt in info.get("requested_downloads", []):
+            if not str(fmt.get("protocol", "")).startswith("m3u8"):
+                continue
+            if not fmt.get("url"):
+                continue
+            return {
+                "url": fmt.get("url", ""),
+                "cookies": fmt.get("cookies", ""),
+                "headers": dict(fmt.get("http_headers") or {}),
+            }
+
         best = None
         best_quality = -10**9
         for fmt in info.get("formats", []):
