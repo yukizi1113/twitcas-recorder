@@ -629,6 +629,10 @@ namespace TwitCasRecorder
         private readonly Action<string> _onRecordComplete; // 録音完了後コールバック(ファイルパス)
         private readonly Dictionary<string, Process> _active =
             new Dictionary<string, Process>();
+        private readonly HashSet<string> _recordingUsers =
+            new HashSet<string>();
+        private readonly HashSet<string> _stopRequested =
+            new HashSet<string>();
         private readonly object _lock = new object();
 
         public StreamRecorder(AppConfig config, TwitCastingAuth auth,
@@ -645,16 +649,19 @@ namespace TwitCasRecorder
         {
             lock (_lock)
             {
-                if (!_active.ContainsKey(userId)) return false;
-                if (_active[userId].HasExited) { _active.Remove(userId); return false; }
-                return true;
+                return _recordingUsers.Contains(userId);
             }
         }
 
         public void StartRecording(string userId, string movieId, string password)
         {
-            lock (_lock) { if (IsRecording(userId)) return; }
-            var t = new Thread(delegate() { Record(userId, movieId, password); });
+            lock (_lock)
+            {
+                if (_recordingUsers.Contains(userId)) return;
+                _recordingUsers.Add(userId);
+                _stopRequested.Remove(userId);
+            }
+            var t = new Thread(delegate() { RecordWithRetry(userId, movieId, password); });
             t.IsBackground = true;
             t.Start();
         }
@@ -735,7 +742,7 @@ namespace TwitCasRecorder
                 proc.BeginErrorReadLine();
                 proc.WaitForExit();
 
-                lock (_lock) { _active.Remove(userId); }
+                
 
                 bool hasOutput = File.Exists(outPath) && new FileInfo(outPath).Length > 0;
                 if (proc.ExitCode == 0 && hasOutput)
@@ -762,6 +769,147 @@ namespace TwitCasRecorder
                     _log("[エラー] yt-dlp または ffmpeg が見つかりません。パスを確認してください。");
                 else
                     _log("[エラー] " + userId + ": " + ex.Message);
+            }
+        }
+
+        private void RecordWithRetry(string userId, string movieId, string password)
+        {
+            string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string baseName = userId + "_" + movieId + "_" + ts;
+            string outPath = Path.Combine(_config.OutputDir, baseName + ".aac");
+            string url = !string.IsNullOrEmpty(movieId)
+                ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
+                : "https://twitcasting.tv/" + userId;
+
+            try
+            {
+                const int maxAttempts = 4;
+                for (int attempt = 1; attempt <= maxAttempts; attempt++)
+                {
+                    if (IsStopRequested(userId))
+                        return;
+
+                    ResolvedStreamSource src = ResolveStreamSource(userId, movieId, url, password);
+                    if (src == null || string.IsNullOrEmpty(src.Url))
+                    {
+                        if (attempt < maxAttempts)
+                        {
+                            _log("[再試行] " + userId + " m3u8 を再解決します (" + attempt + "/" + maxAttempts + ")");
+                            if (WaitBeforeRetry(userId, 3000))
+                                continue;
+                            return;
+                        }
+
+                        _log("[録音] m3u8 を解決できませんでした。yt-dlp にフォールバックします: " + userId);
+                        RecordViaYtDlpFallback(userId, url, password, baseName);
+                        return;
+                    }
+
+                    _log("[録音開始] " + userId + "  url=" + src.Url);
+
+                    var ff = new StringBuilder();
+                    ff.Append("-hide_banner -y -nostdin -loglevel info ");
+                    if (!string.IsNullOrEmpty(src.Cookies))
+                        ff.Append("-cookies \"" + src.Cookies.Replace("\"", "\\\"") + "\" ");
+
+                    string ua;
+                    if (src.Headers.TryGetValue("User-Agent", out ua) && ua != "")
+                        ff.Append("-user_agent \"" + ua.Replace("\"", "\\\"") + "\" ");
+
+                    string headerBlock = BuildHeaderBlock(src.Headers);
+                    if (headerBlock != "")
+                        ff.Append("-headers \"" + headerBlock.Replace("\"", "\\\"") + "\" ");
+
+                    ff.Append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ");
+                    ff.Append("-i \"" + src.Url + "\" ");
+                    ff.Append("-map 0:a:0? -vn -c:a copy -f adts ");
+                    ff.Append("\"" + outPath + "\"");
+
+                    var psi = new ProcessStartInfo();
+                    psi.FileName = _config.FfmpegPath;
+                    psi.Arguments = ff.ToString();
+                    psi.UseShellExecute = false;
+                    psi.RedirectStandardOutput = true;
+                    psi.RedirectStandardError = true;
+                    psi.CreateNoWindow = true;
+                    psi.StandardOutputEncoding = Encoding.UTF8;
+                    psi.StandardErrorEncoding = Encoding.UTF8;
+
+                    bool diskFull = false;
+                    bool retryableFailure = false;
+                    var proc = Process.Start(psi);
+                    lock (_lock) { _active[userId] = proc; }
+
+                    proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                    {
+                        if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                        {
+                            if (e.Data.IndexOf("No space left on device", StringComparison.OrdinalIgnoreCase) >= 0)
+                                diskFull = true;
+                            if (IsRetryableInputFailureLine(e.Data))
+                                retryableFailure = true;
+                            _log("  [" + userId + "] " + e.Data);
+                        }
+                    };
+                    proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                    {
+                        if (!string.IsNullOrEmpty(e.Data) && !e.Data.StartsWith("[debug]"))
+                        {
+                            if (e.Data.IndexOf("No space left on device", StringComparison.OrdinalIgnoreCase) >= 0)
+                                diskFull = true;
+                            if (IsRetryableInputFailureLine(e.Data))
+                                retryableFailure = true;
+                            _log("  [" + userId + "] " + e.Data);
+                        }
+                    };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                    proc.WaitForExit();
+
+                    lock (_lock) { _active.Remove(userId); }
+
+                    bool hasOutput = File.Exists(outPath) && new FileInfo(outPath).Length > 0;
+                    if (proc.ExitCode == 0 && hasOutput)
+                    {
+                        _log("[録音完了] " + userId);
+                        if (_onRecordComplete != null) _onRecordComplete(outPath);
+                        return;
+                    }
+
+                    if (retryableFailure && !diskFull && !hasOutput && !IsStopRequested(userId) && attempt < maxAttempts)
+                    {
+                        DeleteIfExists(outPath);
+                        _log("[再試行] " + userId + " 入力 URL を再解決します (" + attempt + "/" + maxAttempts + ")");
+                        if (WaitBeforeRetry(userId, 3000))
+                            continue;
+                        return;
+                    }
+
+                    _log("[録音終了] " + userId + "  (code:" + proc.ExitCode + ")");
+                    if (diskFull)
+                        _log("[エラー] 保存先ドライブの空き容量が不足しています");
+                    else if (!hasOutput)
+                        _log("[エラー] 音声ファイルが生成されませんでした");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                bool notFound = ex.Message.Contains("cannot find")
+                             || ex.Message.Contains("No such file");
+                if (notFound)
+                    _log("[エラー] yt-dlp または ffmpeg が見つかりません。パスを確認してください");
+                else
+                    _log("[エラー] " + userId + ": " + ex.Message);
+            }
+            finally
+            {
+                lock (_lock)
+                {
+                    _active.Remove(userId);
+                    _recordingUsers.Remove(userId);
+                    _stopRequested.Remove(userId);
+                }
             }
         }
 
@@ -1104,10 +1252,59 @@ namespace TwitCasRecorder
             }
         }
 
+        private bool IsRetryableInputFailureLine(string line)
+        {
+            if (string.IsNullOrEmpty(line)) return false;
+            return line.IndexOf("HTTP error 404", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("HTTP error 403", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("Server returned 404", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("Server returned 403", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("Error opening input file", StringComparison.OrdinalIgnoreCase) >= 0
+                || line.IndexOf("Error opening input files", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsStopRequested(string userId)
+        {
+            lock (_lock)
+            {
+                return _stopRequested.Contains(userId);
+            }
+        }
+
+        private bool WaitBeforeRetry(string userId, int delayMs)
+        {
+            int waited = 0;
+            while (waited < delayMs)
+            {
+                if (IsStopRequested(userId))
+                    return false;
+                Thread.Sleep(250);
+                waited += 250;
+            }
+            return !IsStopRequested(userId);
+        }
+
+        private void DeleteIfExists(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch { }
+        }
+
         public void StopRecording(string userId)
         {
             Process proc = null;
-            lock (_lock) { _active.TryGetValue(userId, out proc); }
+            bool isRecording;
+            lock (_lock)
+            {
+                isRecording = _recordingUsers.Contains(userId);
+                if (isRecording)
+                    _stopRequested.Add(userId);
+                _active.TryGetValue(userId, out proc);
+            }
             if (proc != null)
             {
                 try { if (!proc.HasExited) proc.Kill(); } catch { }
@@ -1121,8 +1318,8 @@ namespace TwitCasRecorder
             string[] ids;
             lock (_lock)
             {
-                ids = new string[_active.Count];
-                _active.Keys.CopyTo(ids, 0);
+                ids = new string[_recordingUsers.Count];
+                _recordingUsers.CopyTo(ids);
             }
             foreach (string id in ids) StopRecording(id);
         }

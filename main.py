@@ -293,6 +293,8 @@ class StreamRecorder:
         self.output_dir = Path(config.get("output_dir", str(APP_DIR / "recordings")))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._active: dict[str, subprocess.Popen] = {}  # user_id -> process
+        self._recording_users: set[str] = set()
+        self._stop_requested: set[str] = set()
         self._lock = threading.Lock()
 
     def _log(self, msg: str):
@@ -300,13 +302,7 @@ class StreamRecorder:
 
     def is_recording(self, user_id: str) -> bool:
         with self._lock:
-            proc = self._active.get(user_id)
-            if proc is None:
-                return False
-            if proc.poll() is not None:
-                del self._active[user_id]
-                return False
-            return True
+            return user_id in self._recording_users
 
     def start_recording(self, user_id: str, movie_info: dict, password: str = ""):
         """録音スレッドを起動する"""
@@ -640,6 +636,192 @@ class StreamRecorder:
     def stop_all(self):
         with self._lock:
             targets = list(self._active.keys())
+        for uid in targets:
+            self.stop_recording(uid)
+
+    def is_recording(self, user_id: str) -> bool:
+        with self._lock:
+            return user_id in self._recording_users
+
+    def start_recording(self, user_id: str, movie_info: dict, password: str = ""):
+        with self._lock:
+            if user_id in self._recording_users:
+                return
+            self._recording_users.add(user_id)
+            self._stop_requested.discard(user_id)
+
+        movie_id = str(movie_info.get("id", "unknown"))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.aac")
+
+        t = threading.Thread(
+            target=self._record,
+            args=(user_id, movie_id, out_path, password),
+            daemon=True,
+        )
+        t.start()
+
+    def _record(self, user_id: str, movie_id: str, out_path: str, password: str):
+        stream_url = (
+            f"https://twitcasting.tv/{user_id}/movie/{movie_id}"
+            if movie_id and movie_id != "unknown"
+            else f"https://twitcasting.tv/{user_id}"
+        )
+
+        try:
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                if self._is_stop_requested(user_id):
+                    return
+
+                source = self._resolve_stream_source(user_id, movie_id, stream_url, password)
+                if not source or not source.get("url"):
+                    if attempt < max_attempts:
+                        self._log(f"[再試行] {user_id} m3u8 を再解決します ({attempt}/{max_attempts})")
+                        if self._wait_before_retry(user_id, 3.0):
+                            continue
+                        return
+
+                    self._log(f"[録音] m3u8 を解決できませんでした。yt-dlp にフォールバックします: {user_id}")
+                    self._record_via_ytdlp_fallback(user_id, stream_url, out_path, password)
+                    return
+
+                ffmpeg = self.config.get("ffmpeg_path", "ffmpeg")
+                cmd = [ffmpeg, "-hide_banner", "-y", "-nostdin", "-loglevel", "info"]
+
+                if source.get("cookies"):
+                    cmd += ["-cookies", source["cookies"]]
+
+                headers = source.get("headers") or {}
+                user_agent = headers.get("User-Agent")
+                if user_agent:
+                    cmd += ["-user_agent", user_agent]
+
+                header_block = self._build_header_block(headers)
+                if header_block:
+                    cmd += ["-headers", header_block]
+
+                cmd += [
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", source["url"],
+                    "-map", "0:a:0?",
+                    "-vn",
+                    "-c:a", "copy",
+                    "-f", "adts",
+                    out_path,
+                ]
+
+                self._log(f"[録音開始] {user_id}  url={source['url']}")
+
+                create_no_window = 0x08000000 if sys.platform == "win32" else 0
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=create_no_window,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                with self._lock:
+                    self._active[user_id] = proc
+
+                disk_full = False
+                retryable_failure = False
+                try:
+                    for line in proc.stdout:
+                        line = line.rstrip()
+                        if line and not line.startswith("[debug]"):
+                            if "No space left on device" in line:
+                                disk_full = True
+                            if self._is_retryable_input_failure_line(line):
+                                retryable_failure = True
+                            self._log(f"  [{user_id}] {line}")
+                finally:
+                    proc.wait()
+                    with self._lock:
+                        self._active.pop(user_id, None)
+
+                has_output = Path(out_path).exists() and Path(out_path).stat().st_size > 0
+                if proc.returncode == 0 and has_output:
+                    self._log(f"[録音完了] {user_id}")
+                    return
+
+                if (
+                    retryable_failure
+                    and not disk_full
+                    and not has_output
+                    and not self._is_stop_requested(user_id)
+                    and attempt < max_attempts
+                ):
+                    self._delete_if_exists(out_path)
+                    self._log(f"[再試行] {user_id} 入力 URL を再解決します ({attempt}/{max_attempts})")
+                    if self._wait_before_retry(user_id, 3.0):
+                        continue
+                    return
+
+                self._log(f"[録音終了] {user_id}  (code:{proc.returncode})")
+                if disk_full:
+                    self._log("[エラー] 保存先ドライブの空き容量が不足しています")
+                elif not has_output:
+                    self._log("[エラー] 音声ファイルが生成されませんでした")
+                return
+
+        except FileNotFoundError:
+            self._log("[エラー] yt-dlp または ffmpeg が見つかりません。パスを確認してください")
+        except Exception as e:
+            self._log(f"[エラー] {user_id}: {e}")
+        finally:
+            with self._lock:
+                self._active.pop(user_id, None)
+                self._recording_users.discard(user_id)
+                self._stop_requested.discard(user_id)
+
+    def _is_retryable_input_failure_line(self, line: str) -> bool:
+        line = line.lower()
+        return (
+            "http error 404" in line
+            or "http error 403" in line
+            or "server returned 404" in line
+            or "server returned 403" in line
+            or "error opening input file" in line
+            or "error opening input files" in line
+        )
+
+    def _is_stop_requested(self, user_id: str) -> bool:
+        with self._lock:
+            return user_id in self._stop_requested
+
+    def _wait_before_retry(self, user_id: str, seconds: float) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._is_stop_requested(user_id):
+                return False
+            time.sleep(0.25)
+        return not self._is_stop_requested(user_id)
+
+    def _delete_if_exists(self, path: str):
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def stop_recording(self, user_id: str):
+        with self._lock:
+            is_recording = user_id in self._recording_users
+            if is_recording:
+                self._stop_requested.add(user_id)
+            proc = self._active.get(user_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+        if is_recording:
+            self._log(f"[停止] {user_id} の録音を停止しました")
+
+    def stop_all(self):
+        with self._lock:
+            targets = list(self._recording_users)
         for uid in targets:
             self.stop_recording(uid)
 
