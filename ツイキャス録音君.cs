@@ -215,6 +215,32 @@ namespace TwitCasRecorder
             return string.Join("; ", list.ToArray());
         }
 
+        public string GetFfmpegCookieString()
+        {
+            var list = new List<string>();
+            foreach (Cookie c in _cookies.GetCookies(TcUri))
+            {
+                string domain = string.IsNullOrEmpty(c.Domain) ? ".twitcasting.tv" : c.Domain;
+                if (!domain.StartsWith(".")) domain = "." + domain;
+                string path = string.IsNullOrEmpty(c.Path) ? "/" : c.Path;
+                string cookie = c.Name + "=" + c.Value
+                    + "; path=" + path
+                    + "; domain=" + domain + ";";
+                if (c.Secure) cookie += " secure;";
+                list.Add(cookie);
+            }
+            return string.Join("\r\n", list.ToArray());
+        }
+
+        public string ExternalToolCookiePath()
+        {
+            string src = NetscapeCookiePath();
+            string dst = Path.Combine(Path.GetTempPath(), "twitcas_recorder_cookies.txt");
+            if (File.Exists(src))
+                File.Copy(src, dst, true);
+            return dst;
+        }
+
         public HttpWebRequest CreateAuthRequest(string url)
         {
             var req = (HttpWebRequest)WebRequest.Create(url);
@@ -809,8 +835,11 @@ namespace TwitCasRecorder
 
                     var ff = new StringBuilder();
                     ff.Append("-hide_banner -y -nostdin -loglevel info ");
-                    if (!string.IsNullOrEmpty(src.Cookies))
-                        ff.Append("-cookies \"" + src.Cookies.Replace("\"", "\\\"") + "\" ");
+                    string ffmpegCookies = _auth.GetFfmpegCookieString();
+                    if (string.IsNullOrEmpty(ffmpegCookies))
+                        ffmpegCookies = src.Cookies;
+                    if (!string.IsNullOrEmpty(ffmpegCookies))
+                        ff.Append("-cookies \"" + ffmpegCookies.Replace("\"", "\\\"") + "\" ");
 
                     string ua;
                     if (src.Headers.TryGetValue("User-Agent", out ua) && ua != "")
@@ -987,7 +1016,7 @@ namespace TwitCasRecorder
 
             var src = new ResolvedStreamSource();
             src.Url = streamUrl;
-            src.Cookies = _auth.GetCookieHeader();
+            src.Cookies = _auth.GetFfmpegCookieString();
             src.Headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                       + "AppleWebKit/537.36 (KHTML, like Gecko) "
                                       + "Chrome/122.0.0.0 Safari/537.36";
@@ -1000,8 +1029,9 @@ namespace TwitCasRecorder
         {
             var sb = new StringBuilder();
             sb.Append("-J --no-playlist ");
-            if (File.Exists(_auth.NetscapeCookiePath()))
-                sb.Append("--cookies \"" + _auth.NetscapeCookiePath() + "\" ");
+            string cookiePath = _auth.ExternalToolCookiePath();
+            if (File.Exists(cookiePath))
+                sb.Append("--cookies \"" + cookiePath + "\" ");
             if (!string.IsNullOrEmpty(password))
                 sb.Append("--video-password \"" + password + "\" ");
             sb.Append("\"" + url + "\"");
@@ -1200,8 +1230,9 @@ namespace TwitCasRecorder
             if (!string.IsNullOrEmpty(_config.FfmpegPath))
                 sb.Append("--ffmpeg-location \"" + _config.FfmpegPath + "\" ");
             sb.Append("-o \"" + outTmpl + "\" ");
-            if (File.Exists(_auth.NetscapeCookiePath()))
-                sb.Append("--cookies \"" + _auth.NetscapeCookiePath() + "\" ");
+            string cookiePath = _auth.ExternalToolCookiePath();
+            if (File.Exists(cookiePath))
+                sb.Append("--cookies \"" + cookiePath + "\" ");
             if (!string.IsNullOrEmpty(password))
                 sb.Append("--video-password \"" + password + "\" ");
             sb.Append("\"" + url + "\"");

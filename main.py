@@ -18,6 +18,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -475,7 +476,7 @@ class StreamRecorder:
 
         return {
             "url": stream_url,
-            "cookies": self._session_cookie_header(),
+            "cookies": self._ffmpeg_cookie_string(),
             "headers": {
                 "User-Agent": session.headers.get("User-Agent", ""),
                 "Origin": "https://twitcasting.tv",
@@ -487,8 +488,9 @@ class StreamRecorder:
         ytdlp = self.config.get("ytdlp_path", "yt-dlp")
         cmd = [ytdlp, "-J", "--no-playlist"]
 
-        if NETSCAPE_COOKIES_FILE.exists():
-            cmd += ["--cookies", str(NETSCAPE_COOKIES_FILE)]
+        cookie_file = self._external_cookie_file()
+        if cookie_file:
+            cmd += ["--cookies", str(cookie_file)]
         if password:
             cmd += ["--video-password", password]
         cmd.append(stream_url)
@@ -556,6 +558,33 @@ class StreamRecorder:
                 cookies.append(f"{c.name}={c.value}")
         return "; ".join(cookies)
 
+    def _ffmpeg_cookie_string(self) -> str:
+        parts = []
+        for c in self.auth.get_session().cookies:
+            domain = c.domain or ""
+            if "twitcasting.tv" not in domain and domain != "":
+                continue
+            if not domain:
+                domain = ".twitcasting.tv"
+            if not domain.startswith("."):
+                domain = "." + domain
+            path = c.path or "/"
+            segment = f"{c.name}={c.value}; path={path}; domain={domain};"
+            if c.secure:
+                segment += " secure;"
+            parts.append(segment)
+        return "\r\n".join(parts)
+
+    def _external_cookie_file(self) -> Path | None:
+        if not NETSCAPE_COOKIES_FILE.exists():
+            return None
+        target = Path(tempfile.gettempdir()) / "twitcas_recorder_cookies.txt"
+        target.write_text(
+            NETSCAPE_COOKIES_FILE.read_text(encoding="utf-8-sig"),
+            encoding="utf-8",
+        )
+        return target
+
     def _append_query_param(self, url: str, key: str, value: str) -> str:
         parsed = urlsplit(url)
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -589,8 +618,9 @@ class StreamRecorder:
             "--audio-quality", "0",
             "-o", out_tmpl,
         ]
-        if NETSCAPE_COOKIES_FILE.exists():
-            cmd += ["--cookies", str(NETSCAPE_COOKIES_FILE)]
+        cookie_file = self._external_cookie_file()
+        if cookie_file:
+            cmd += ["--cookies", str(cookie_file)]
         if password:
             cmd += ["--video-password", password]
         ffmpeg = self.config.get("ffmpeg_path", "ffmpeg")
@@ -689,8 +719,9 @@ class StreamRecorder:
                 ffmpeg = self.config.get("ffmpeg_path", "ffmpeg")
                 cmd = [ffmpeg, "-hide_banner", "-y", "-nostdin", "-loglevel", "info"]
 
-                if source.get("cookies"):
-                    cmd += ["-cookies", source["cookies"]]
+                ffmpeg_cookies = self._ffmpeg_cookie_string() or source.get("cookies", "")
+                if ffmpeg_cookies:
+                    cmd += ["-cookies", ffmpeg_cookies]
 
                 headers = source.get("headers") or {}
                 user_agent = headers.get("User-Agent")
