@@ -548,7 +548,7 @@ namespace TwitCasRecorder
 
             string outputDir = Path.GetDirectoryName(audioPath);
 
-            // whisper "audio.aac" --model large --language ja
+            // whisper "audio.mp3" --model large --language ja
             //         --output_format txt --output_dir "dir"
             string args = "\"" + audioPath + "\""
                         + " --model "          + _config.WhisperModel
@@ -696,7 +696,7 @@ namespace TwitCasRecorder
         {
             string ts       = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string baseName = userId + "_" + movieId + "_" + ts;
-            string outPath  = Path.Combine(_config.OutputDir, baseName + ".aac");
+            string outPath  = Path.Combine(_config.OutputDir, baseName + ".mp3");
             // movieId が判明している場合は直接 movie URL を使う (より確実)
             string url = (!string.IsNullOrEmpty(movieId))
                 ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
@@ -729,7 +729,7 @@ namespace TwitCasRecorder
 
                 ff.Append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ");
                 ff.Append("-i \"" + src.Url + "\" ");
-                ff.Append("-map 0:a:0? -vn -c:a copy -f adts ");
+                ff.Append("-map 0:a:0? -vn -c:a libmp3lame -q:a 0 -f mp3 ");
                 ff.Append("\"" + outPath + "\"");
 
                 var psi = new ProcessStartInfo();
@@ -802,7 +802,7 @@ namespace TwitCasRecorder
         {
             string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string baseName = userId + "_" + movieId + "_" + ts;
-            string outPath = Path.Combine(_config.OutputDir, baseName + ".aac");
+            string outPath = Path.Combine(_config.OutputDir, baseName + ".mp3");
             string url = !string.IsNullOrEmpty(movieId)
                 ? "https://twitcasting.tv/" + userId + "/movie/" + movieId
                 : "https://twitcasting.tv/" + userId;
@@ -851,7 +851,7 @@ namespace TwitCasRecorder
 
                     ff.Append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 ");
                     ff.Append("-i \"" + src.Url + "\" ");
-                    ff.Append("-map 0:a:0? -vn -c:a copy -f adts ");
+                    ff.Append("-map 0:a:0? -vn -c:a libmp3lame -q:a 0 -f mp3 ");
                     ff.Append("\"" + outPath + "\"");
 
                     var psi = new ProcessStartInfo();
@@ -1226,7 +1226,7 @@ namespace TwitCasRecorder
             string outTmpl = Path.Combine(_config.OutputDir, baseName + ".%(ext)s");
             var sb = new StringBuilder();
             sb.Append("--no-playlist --no-part ");
-            sb.Append("-x --audio-format aac --audio-quality 0 ");
+            sb.Append("-x --audio-format mp3 --audio-quality 0 ");
             if (!string.IsNullOrEmpty(_config.FfmpegPath))
                 sb.Append("--ffmpeg-location \"" + _config.FfmpegPath + "\" ");
             sb.Append("-o \"" + outTmpl + "\" ");

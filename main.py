@@ -285,7 +285,7 @@ class StreamMonitor:
 # ============================================================
 
 class StreamRecorder:
-    """Resolve live HLS with yt-dlp and capture audio-only AAC with ffmpeg."""
+    """Resolve live HLS with yt-dlp and capture audio-only MP3 with ffmpeg."""
 
     def __init__(self, config: dict, auth: TwitCastingAuth, log_callback=None):
         self.config = config
@@ -313,7 +313,7 @@ class StreamRecorder:
 
         movie_id = str(movie_info.get("id", "unknown"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.aac")
+        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.mp3")
 
         t = threading.Thread(
             target=self._record,
@@ -357,8 +357,9 @@ class StreamRecorder:
                 "-i", source["url"],
                 "-map", "0:a:0?",
                 "-vn",
-                "-c:a", "copy",
-                "-f", "adts",
+                "-c:a", "libmp3lame",
+                "-q:a", "0",
+                "-f", "mp3",
                 out_path,
             ]
 
@@ -614,7 +615,7 @@ class StreamRecorder:
             "--no-playlist",
             "--no-part",
             "-x",
-            "--audio-format", "aac",
+            "--audio-format", "mp3",
             "--audio-quality", "0",
             "-o", out_tmpl,
         ]
@@ -682,7 +683,7 @@ class StreamRecorder:
 
         movie_id = str(movie_info.get("id", "unknown"))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.aac")
+        out_path = str(self.output_dir / f"{user_id}_{movie_id}_{timestamp}.mp3")
 
         t = threading.Thread(
             target=self._record,
@@ -739,8 +740,9 @@ class StreamRecorder:
                     "-i", source["url"],
                     "-map", "0:a:0?",
                     "-vn",
-                    "-c:a", "copy",
-                    "-f", "adts",
+                    "-c:a", "libmp3lame",
+                    "-q:a", "0",
+                    "-f", "mp3",
                     out_path,
                 ]
 
